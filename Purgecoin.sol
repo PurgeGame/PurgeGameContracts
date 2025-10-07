@@ -341,14 +341,13 @@ contract Purgecoin is ERC20, VRFConsumerBaseV2Plus {
     /// - Enforces no overlap/collision with caller’s existing stakes.
     function stake(uint256 burnAmt, uint24 targetLevel, uint8 risk) external {
         if (burnAmt < 250 * MILLION) revert AmountLTMin();
-
         if(isBettingPaused) revert BettingPaused();
 
         uint24 currLevel = IPurgeGame(purgeGameContract).level();
         if (targetLevel < currLevel + 10) revert Insufficient();
 
         uint24 distance = targetLevel - currLevel;
-        if (risk == 0 || risk > MAX_RISK || risk > distance || distance > 500) revert Insufficient();
+        if (risk == 0 || risk > MAX_RISK || risk > distance) revert Insufficient();
 
         // Starting level where this stake is placed (inclusive)
         uint24 placeLevel = uint24(targetLevel - (risk - 1));
@@ -443,7 +442,7 @@ contract Purgecoin is ERC20, VRFConsumerBaseV2Plus {
     /// Payout rules:
     /// - `amount` is optionally doubled on levels `level % 25 == 1`.
     /// - Direct ref gets full `amount`; their upline (if any and already active this level)
-    ///   receives a 10% bonus of the same (post‑doubling) amount.
+    ///   receives a 20% bonus of the same (post‑doubling) amount.
     function payAffiliate(uint256 amount, bytes32 code, address sender, uint24 lvl)
         external
         onlyPurgeGameContract
@@ -476,7 +475,7 @@ contract Purgecoin is ERC20, VRFConsumerBaseV2Plus {
                 _updatePlayerScore(1, affiliateAddr, newTotal);
             }
 
-            // Upline bonus (10%) only if upline is active this level
+            // Upline bonus (20%) only if upline is active this level
             address upline = referredBy[affiliateAddr];
             if (
                 upline != address(0) &&
