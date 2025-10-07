@@ -327,7 +327,7 @@ contract PurgeGame is ERC721A {
                     phase = 7;
                     break;
                 }
-                bool bonusFlip = (jackpotCounter == 1);
+                bool bonusFlip = (jackpotCounter == 2);
                 if (_endJackpot(lvl, cap, day, bonusFlip)) phase = 6;
                 break;
             }
