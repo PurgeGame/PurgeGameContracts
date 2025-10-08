@@ -92,12 +92,12 @@ contract PurgeGame is ERC721A {
     // Economic / Admin
     // -----------------------
     address private immutable creator;      // Receives protocol ETH (end-game drains, etc.)
-    uint256 private price = 0.025 ether;    // Base mint price (adjusts with level milestones)
+    uint256 private price = 0.025 ether;    // Base mint price (adjusts with level milestones)                  / MILLION FOR TESTNET
 
     // -----------------------
     // Prize Pools and RNG
     // -----------------------
-    uint256 private lastPrizePool     = 125 ether; // Snapshot from previous epoch (non-zero post L1)
+    uint256 private lastPrizePool     = 125 ether; // Snapshot from previous epoch (non-zero post L1)         / MILLION FOR TESTNET
     uint256 private levelPrizePool;                // Snapshot for endgame distribution of current level
     uint256 private prizePool;                     // Live ETH pool for current level
     uint256 private carryoverForNextLevel;         // Saved carryover % for next level
@@ -201,6 +201,7 @@ contract PurgeGame is ERC721A {
     /// @return price_                   Current mint price (wei)
     /// @return lastPrizePool_           Previous level's effective prize pool snapshot (wei)
     /// @return prizePool_               Current level’s live prize pool (wei)
+    /// @return levelPrizePool_          Actual prize pool to be paid (wei)
     /// @return carryoverForNextLevel_   Amount reserved for next level (wei)
     /// @return enoughPurchases          True if purchaseCount >= 1500
     /// @return rngFulfilled_            Last VRF request fulfilled
@@ -214,6 +215,7 @@ contract PurgeGame is ERC721A {
             uint256 price_,
             uint256 lastPrizePool_,
             uint256 prizePool_,
+            uint256 levelPrizePool_,
             uint256 carryoverForNextLevel_,
             bool enoughPurchases,
             bool rngFulfilled_,
@@ -225,6 +227,7 @@ contract PurgeGame is ERC721A {
         price_                   = price;
         lastPrizePool_           = lastPrizePool;
         prizePool_               = prizePool;
+        levelPrizePool_          = levelPrizePool;
         carryoverForNextLevel_   = carryoverForNextLevel;
         enoughPurchases          = (purchaseCount >= 1500);
         rngFulfilled_            = rngFulfilled;
@@ -285,8 +288,7 @@ contract PurgeGame is ERC721A {
                 _updateEarlyPurgeJackpots(lvl);
                 if (ph == 2 && purchaseCount >= 1500 && prizePool >= lastPrizePool) {
                     if (lvl % 100 > 90) price = (price * 4) / 5;
-                        _endJackpot(lvl, cap, day, false);  
-                        phase = 3;
+                        if (_endJackpot(lvl, cap, day, false)) phase = 3;
                         break;
                 }else if (ph == 3 && jackpotCounter == 0) {
                     gameState = 3;
@@ -333,7 +335,7 @@ contract PurgeGame is ERC721A {
             }
 
             // --- State 0 ---
-            if (s == 0) { if (rngFulfilled) _endJackpot(lvl, cap, day, false); }
+            if (s == 0) { _endJackpot(lvl, cap, day, false); }
         } while (false);
 
         if (s != 0 && cap == 0) coin.mintInGame(msg.sender, PRICE_PURGECOIN);
@@ -633,9 +635,6 @@ contract PurgeGame is ERC721A {
             levelPrizePool = pool;
             _clearDailyPurgeCount();
 
-            unchecked {
-                ++level;
-            }
         } else {
             // Non-trait end (e.g., daily jackpot progression end)
             lvlData.exterminatedTrait = 420;
@@ -648,17 +647,12 @@ contract PurgeGame is ERC721A {
 
             carryoverForNextLevel += prizePool;
             IPurgeCoinInterface(_coin).resetAffiliateLeaderboard();
-
-            unchecked {
-                ++level;
-            }
         }
 
         // Move to the next level’s storage index
         unchecked {
-            levelSnapshot++;
+            levelSnapshot++; level++;
         }
-
         // Reset level state
         prizePool = 0;
         for (uint16 t; t < 256; ) {
@@ -861,8 +855,10 @@ contract PurgeGame is ERC721A {
         uint8 numWinners,
         uint8 salt
     ) external view returns (address[] memory) {
+        uint24 lvl = level;
+        if (gameState == 1) lvl -=1;
         return JackpotUtils._randTraitTicket(
-            L[level].traitPurgeTicket,
+            L[lvl].traitPurgeTicket,
             randomWord,
             trait,
             numWinners,
@@ -1315,28 +1311,29 @@ contract PurgeGame is ERC721A {
         while (i < endIndex) {
             uint32 groupIdx = i >> 4; // i / 16
             uint256 seed = uint256(keccak256(abi.encodePacked(baseKey + groupIdx, entropyWord)));
-            uint64 s = uint64(seed) | 1; // keep odd
+            uint64 s = uint64(seed) | 1;
 
-            for (uint8 j; j < 16 && i < endIndex; ) {
-                unchecked {
-                    // xorshift64* (Marsaglia) step
-                    s ^= (s >> 12);
-                    s ^= (s << 25);
-                    s ^= (s >> 27);
-                    uint64 rnd64 = s * 2685821657736338717;
+            // align to the correct intra-group position
+            uint8 offset = uint8(i & 15);
+            for (uint8 skip; skip < offset; ) {
+                s ^= (s >> 12); s ^= (s << 25); s ^= (s >> 27);
+                s *= 2685821657736338717;
+                unchecked { ++skip; }
+            }
 
-                    // Each symbol belongs to one of four “quadrants” (0..3) -> map into 0..255 buckets.
-                    uint8 quadrant = uint8(i & 3);
-                    uint8 traitId  = _getTrait(rnd64) + (quadrant << 6);
+            // now produce symbols from the aligned position
+            for (uint8 j = offset; j < 16 && i < endIndex; ) {
+                s ^= (s >> 12); s ^= (s << 25); s ^= (s >> 27);
+                uint64 rnd64 = s * 2685821657736338717;
 
-                    if (counts[traitId]++ == 0) {
-                        touchedTraits[touchedLen++] = traitId;
-                    }
+                uint8 quadrant = uint8(i & 3);
+                uint8 traitId  = _getTrait(rnd64) + (quadrant << 6);
 
-                    ++i; ++j;
-                }
+                if (counts[traitId]++ == 0) { touchedTraits[touchedLen++] = traitId; }
+                unchecked { ++i; ++j; }
             }
         }
+
 
         // Persist results: update contributions and append tickets.
         LevelData storage curr = L[level];

@@ -335,19 +335,16 @@ contract Purgecoin is ERC20, VRFConsumerBaseV2Plus {
     /// @notice Burn PURGED to open a future “stake window” targeting `targetLevel` with a risk radius.
     /// @dev
     /// - `burnAmt` must be ≥ 250e6 (6d).
-    /// - `targetLevel` must be at least 10 levels ahead of the current game level.
+    /// - `targetLevel` must be at least 11 levels ahead of the current game level.
     /// - `risk` ∈ [1..MAX_RISK] and cannot exceed the distance to `targetLevel`.
     /// - Encodes stake as: principal rounded to RF_BASE (100) + 2‑digit risk code.
     /// - Enforces no overlap/collision with caller’s existing stakes.
     function stake(uint256 burnAmt, uint24 targetLevel, uint8 risk) external {
         if (burnAmt < 250 * MILLION) revert AmountLTMin();
         if(isBettingPaused) revert BettingPaused();
-
         uint24 currLevel = IPurgeGame(purgeGameContract).level();
-        if (targetLevel < currLevel + 10) revert Insufficient();
-
         uint24 distance = targetLevel - currLevel;
-        if (risk == 0 || risk > MAX_RISK || risk > distance) revert Insufficient();
+        if (risk == 0 || risk > MAX_RISK || distance > 500 || distance < MAX_RISK) revert Insufficient();
 
         // Starting level where this stake is placed (inclusive)
         uint24 placeLevel = uint24(targetLevel - (risk - 1));
@@ -618,8 +615,7 @@ contract Purgecoin is ERC20, VRFConsumerBaseV2Plus {
     /// @notice VRF callback: store the random word once for the expected request.
     /// @dev Reverts if `requestId` does not match the most recent request or if already fulfilled.
     function fulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) internal override {
-        if (requestId != rngRequestId) revert E();
-        if (rng.fulfilled) revert E();
+        if (requestId != rngRequestId || rng.fulfilled) return;
         rng.fulfilled = true;
         rng.word = randomWords[0];
     }
@@ -668,6 +664,7 @@ contract Purgecoin is ERC20, VRFConsumerBaseV2Plus {
     ///      (4) Cleanup in batches; on completion, reset per‑round state and unpause betting.
     /// @param level Current PurgeGame level (used to gate 1/run and propagate stakes).
     /// @param cap   Work cap hint. cap==0 uses defaults; otherwise applies directly.
+    /// @param bonusFlip Applies 20% bonus to 2nd flip of the level
     /// @return finished True once the entire cycle—including cleanup—has completed.
     function processCoinflipPayouts(uint24 level, uint32 cap, bool bonusFlip)
         external
@@ -676,8 +673,8 @@ contract Purgecoin is ERC20, VRFConsumerBaseV2Plus {
     {
         if (!isBettingPaused) return true;
         // --- Step sizing (bounded work) ----------------------------------------------------
-        uint32 stepStake   = (cap == 0) ? 150 : cap;      // # stakers to process this call
-        uint32 stepPayout  = (cap == 0) ? 150 : cap;      // # players to pay this call
+        uint32 stepStake   = (cap == 0) ? 200 : cap;      // # stakers to process this call
+        uint32 stepPayout  = (cap == 0) ? 200 : cap;      // # players to pay this call
         uint32 cleanupStep = (cap == 0)
             ? CLEANUP_BATCH
             : uint32((uint256(cap) + BUCKET_SIZE - 1) / BUCKET_SIZE + 2); // ~cap/BUCKET_SIZE + slack
@@ -1384,7 +1381,11 @@ contract Purgecoin is ERC20, VRFConsumerBaseV2Plus {
     /// @param p   Player address.
     function _decPush(uint24 lvl, address p) internal {
         uint256 idx = decPlayersCount[lvl];
-        decBuckets[lvl][idx / BUCKET_SIZE].push(p);
+        uint256 bucketIdx = idx / BUCKET_SIZE;
+        if (bucketIdx == decBuckets[lvl].length) {
+            decBuckets[lvl].push();
+        }
+        decBuckets[lvl][bucketIdx].push(p);
         unchecked { decPlayersCount[lvl] = idx + 1; }
     }
 
@@ -1402,6 +1403,7 @@ contract Purgecoin is ERC20, VRFConsumerBaseV2Plus {
         if (isBettingPaused) revert BettingPaused();
         if (msg.sender != address(LINK)) revert E();
         if (amount == 0) revert Zero();
+
 
         // fund VRF sub
         if (!LINK.transferAndCall(address(s_vrfCoordinator), amount, abi.encode(vrfSubscriptionId))) {
