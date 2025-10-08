@@ -150,7 +150,6 @@ contract Purgecoin is ERC20, VRFConsumerBaseV2Plus {
     // Scan cursors / progress
     uint24 private stakeLevelComplete;
     uint32 private scanCursor = SS_IDLE;
-    uint32 private cleanupCursor = SS_IDLE;
     uint32 private coinflipPlayersCount;
     uint32 private payoutIndex;
 
