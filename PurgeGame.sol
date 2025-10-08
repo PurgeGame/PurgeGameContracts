@@ -40,7 +40,7 @@ interface IPurgeCoinInterface {
 }
 
 /**
- * @dev Interface to the off-chain renderer used for tokenURI generation.
+ * @dev Interface to the on-chain renderer used for tokenURI generation.
  */
 interface IPurgeRenderer {
     function setStartingTraitRemaining(uint32[256] calldata values) external;
@@ -78,6 +78,7 @@ contract PurgeGame is ERC721A {
     address private immutable _renderer; // Trusted renderer; used for tokenURI composition
     address private immutable _coin;     // Trusted coin/game-side coordinator (PURGE ERC20)
 
+
     // -----------------------
     // Game Constants
     // -----------------------
@@ -86,18 +87,19 @@ contract PurgeGame is ERC721A {
     uint256 private constant PRICE_PURGECOIN  = 1000 * MILLION;   // 1,000 Purgecoin (6d)
     uint32  private constant NFT_AIRDROP_PLAYER_BATCH_SIZE = 75;    // Mint batch cap (# players)
     uint32  private constant NFT_AIRDROP_TOKEN_CAP         = 3_000; // Mint batch cap (# tokens)
+    uint32  private constant DEFAULT_PAYOUTS_PER_TX = 550; // ≤16M worst-case
     uint72  private constant MAP_PERMILLE = 0x0A0A07060304050564;   // Payout permilles packed (9 bytes)
 
     // -----------------------
     // Economic / Admin
     // -----------------------
     address private immutable creator;      // Receives protocol ETH (end-game drains, etc.)
-    uint256 private price = 0.025 ether;    // Base mint price (adjusts with level milestones)                  / MILLION FOR TESTNET
+    uint256 private price = 0.025 ether;    // Base mint price (adjusts with level milestones)                
 
     // -----------------------
     // Prize Pools and RNG
     // -----------------------
-    uint256 private lastPrizePool     = 125 ether; // Snapshot from previous epoch (non-zero post L1)         / MILLION FOR TESTNET
+    uint256 private lastPrizePool     = 125 ether; // Snapshot from previous epoch (non-zero post L1)        
     uint256 private levelPrizePool;                // Snapshot for endgame distribution of current level
     uint256 private prizePool;                     // Live ETH pool for current level
     uint256 private carryoverForNextLevel;         // Saved carryover % for next level
@@ -118,6 +120,7 @@ contract PurgeGame is ERC721A {
     uint8  private jackpotCounter;               // # of daily jackpots paid in current level
     uint8  private earlyPurgeJackpotPaidMask;    // Bitmask for early purge jackpots paid (progressive)
     uint8  private phase;                        // Airdrop sub-phase (0..7)
+    uint16 private lastExterminatedTrait = 420;  // The winning trait from the previous season (420 sentinel)
 
     // -----------------------
     // RNG Liveness Flags
@@ -146,21 +149,9 @@ contract PurgeGame is ERC721A {
     mapping(address => uint256) private claimableWinnings;  // ETH claims accumulated on-chain
     mapping(uint256 => uint256) private trophyData;         // Trophy metadata by tokenId
     uint256[] private trophyTokenIds;                       // Historical trophies
+    mapping(uint8 => address[]) private traitPurgeTicket;
 
-    /**
-     * @dev Per-level storage (avoid large structs in arrays; keep mappings nested for gas).
-     * - `endgamePayoutAmount` — per-ticket payout for purge contributors on exterminated trait.
-     * - `exterminatedTrait`  — 0..255 when a trait wins; 420 sentinel when "no extermination" / rollover.
-     * - `traitContributions` — contribution counts per trait per address for endgame payouts.
-     * - `traitPurgeTicket`   — per-trait ticket arrays for jackpot drawings.
-     */
-    struct LevelData {
-        uint256 endgamePayoutAmount;
-        uint16  exterminatedTrait;
-        mapping(uint8 => mapping(address => uint32)) traitContributions;
-        mapping(uint8 => address[])                  traitPurgeTicket;
-    }
-    mapping(uint24 => LevelData) private L;
+
 
     // -----------------------
     // Daily / Trait Counters
@@ -190,8 +181,6 @@ contract PurgeGame is ERC721A {
         // Initialize sentinel trophyData for tokenId 0 (0xFFFF in high 16 bits of slot schema).
         trophyData[0] = (0xFFFF << 152);
 
-        // Level 0 sentinel: no extermination (420 = sentinel "none")
-        L[0].exterminatedTrait = 420;
     }
     // --- View: lightweight game status -------------------------------------------------
 
@@ -272,6 +261,13 @@ contract PurgeGame is ERC721A {
 
             // --- State 1 - Pregame ---
             if (s == 1) {
+                // 1) pay participants for last extermination (payEach cached in prizePool)
+                if (lastExterminatedTrait < 256 && prizePool != 0) { _payoutParticipants(cap); break; }
+
+                // 2) then wipe ticket arrays (reuses airdropIndex as 0..256 cursor)
+                if (airdropIndex < 256) { _wipeTickets(cap); break; }
+
+                // 3) finalize affiliates/trophies/exterminator, then proceed
                 _finalizeEndgame(lvl);
                 if (gameState == 1 && _endJackpot(lvl, cap, day, false)) gameState = 2;
                 break;
@@ -281,9 +277,11 @@ contract PurgeGame is ERC721A {
             if (s == 2) {
                 _updateEarlyPurgeJackpots(lvl);
                 if (ph == 2 && purchaseCount >= 1500 && prizePool >= lastPrizePool) {
-                    if (lvl % 100 > 90) price = (price * 4) / 5;
-                        if (_endJackpot(lvl, cap, day, false)) phase = 3;
-                        break;
+                    if (_endJackpot(lvl, cap, day, true)){ 
+                        phase = 3;
+                        if (lvl % 100 > 90 && phase == 3) price = (price * 4) / 5;
+                    }
+                    break;
                 }else if (ph == 3 && jackpotCounter == 0) {
                     gameState = 3;
                     IPurgeRenderer(_renderer).setStartingTraitRemaining(traitRemaining);
@@ -292,7 +290,6 @@ contract PurgeGame is ERC721A {
                 }
                 if (airdropIndex < pendingMapMints.length) { _processMapBatch(cap); break; }
                 if (jackpotCounter > 0) { payDailyJackpot(false, lvl); break; }
-
                 _endJackpot(lvl, cap, day, false);
                 break;
             }
@@ -323,8 +320,7 @@ contract PurgeGame is ERC721A {
                     phase = 7;
                     break;
                 }
-                bool bonusFlip = (jackpotCounter == 2);
-                if (_endJackpot(lvl, cap, day, bonusFlip)) phase = 6;
+                if (_endJackpot(lvl, cap, day, false)) phase = 6;
                 break;
             }
 
@@ -354,7 +350,7 @@ contract PurgeGame is ERC721A {
         bytes32 affiliateCode
     ) external payable {
         uint8 ph = phase;
-        if (quantity == 0 || quantity > 100 || (!rngConsumed && ph == 3) || ph > 3) revert NotTimeYet();
+        if (quantity == 0 || quantity > 100 || gameState != 2 ||(!rngConsumed && ph == 3)) revert NotTimeYet();
         uint24 lvl = level;
         if (lvl % 100 == 0) {
             if (IPurgeCoinInterface(_coin).playerLuckbox(msg.sender) < 10 * PRICE_PURGECOIN * (lvl / 100)) revert LuckboxTooSmall();
@@ -476,110 +472,63 @@ contract PurgeGame is ERC721A {
     /// Rewards:
     /// - Mints Purgecoin to the caller: base `n` plus up to +0.9×n (in tenths) if the NFT
     ///   included last level’s exterminated trait.
-    function purge(uint256[] calldata tokenIds) external {
-        // Disallow contracts and meta-tx relays
-        uint256 extSize;
-        assembly {
-            extSize := extcodesize(caller())
-        }
-        if (extSize != 0 || tx.origin != msg.sender) revert E();
+function purge(uint256[] calldata tokenIds) external {
+    uint256 extSize;
+    assembly { extSize := extcodesize(caller()) }
+    if (extSize != 0 || tx.origin != msg.sender) revert E();
+    if (gameState != 4 || !rngConsumed) revert NotTimeYet();
 
-        if (gameState != 4 || !rngConsumed) revert NotTimeYet();
+    uint256 count = tokenIds.length;
+    if (count == 0 || count > 75) revert E();
+    uint24 lvl = level;
 
-        uint256 count = tokenIds.length;
-        if (count == 0 || count > 75) revert E();
-        uint24 lvl = level;
+    uint16 prevExterminated = lastExterminatedTrait;
+    address caller = msg.sender;
+    uint256 bonusTenths;
 
-        uint16 prevExterminated = L[lvl - 1].exterminatedTrait;
-        LevelData storage lvlData = L[lvl];
-        mapping(uint8 => address[]) storage purgeTickets = lvlData.traitPurgeTicket;
+    for (uint256 i; i < count; ) {
+        uint256 tokenId = tokenIds[i];
+        if (ownerOf(tokenId) != caller || trophyData[tokenId] != 0) revert E();
 
-        address caller = msg.sender;
-        uint256 bonusTenths;
+        uint24 traits = tokenTraits[tokenId];
+        uint8 trait0 = uint8(traits & 0x3F);
+        uint8 trait1 = (uint8(traits >> 6) & 0x3F) | 64;
+        uint8 trait2 = (uint8(traits >> 12) & 0x3F) | 128;
+        uint8 trait3 = (uint8(traits >> 18) & 0x3F) | 192;
 
-        for (uint256 i; i < count; ) {
-            uint256 tokenId = tokenIds[i];
+        if (
+            uint16(trait0) == prevExterminated ||
+            uint16(trait1) == prevExterminated ||
+            uint16(trait2) == prevExterminated ||
+            uint16(trait3) == prevExterminated
+        ) { unchecked { bonusTenths += 9; } }
 
-            // Ownership & trophy checks
-            if (ownerOf(tokenId) != caller || trophyData[tokenId] != 0) revert E();
+        _burn(tokenId, false);
 
-            // Decode the four traits packed in `tokenTraits[tokenId]`
-            uint24 traits = tokenTraits[tokenId];
-            uint8 trait0 = uint8(traits & 0x3F);
-            uint8 trait1 = (uint8(traits >> 6) & 0x3F) | 64;
-            uint8 trait2 = (uint8(traits >> 12) & 0x3F) | 128;
-            uint8 trait3 = (uint8(traits >> 18) & 0x3F) | 192;
+        unchecked {
+            dailyPurgeCount[trait0 & 0x07] += 1;
+            dailyPurgeCount[((trait1 - 64) >> 3) + 8] += 1;
+            dailyPurgeCount[trait2 - 128 + 16] += 1;
 
-            // Bonus if the NFT includes last level’s exterminated trait
-            if (
-                uint16(trait0) == prevExterminated ||
-                uint16(trait1) == prevExterminated ||
-                uint16(trait2) == prevExterminated ||
-                uint16(trait3) == prevExterminated
-            ) {
-                unchecked {
-                    bonusTenths += 9; // +0.9 per such token
-                }
-            }
+            if (--traitRemaining[trait0] == 0) { _endLevel(trait0); return; }
+            if (--traitRemaining[trait1] == 0) { _endLevel(trait1); return; }
+            if (--traitRemaining[trait2] == 0) { _endLevel(trait2); return; }
+            if (--traitRemaining[trait3] == 0) { _endLevel(trait3); return; }
 
-            // Burn first, then counters / termination checks
-            _burn(tokenId, false);
-
-            unchecked {
-                // Daily counters (grouped by class/slot)
-                dailyPurgeCount[trait0 & 0x07] += 1;
-                dailyPurgeCount[((trait1 - 64) >> 3) + 8] += 1;
-                dailyPurgeCount[trait2 - 128 + 16] += 1;
-
-                // Per-trait remaining supply; end the level immediately when any hits zero
-                if (--traitRemaining[trait0] == 0) {
-                    _endLevel(trait0);
-                    return;
-                }
-                if (--traitRemaining[trait1] == 0) {
-                    _endLevel(trait1);
-                    return;
-                }
-                if (--traitRemaining[trait2] == 0) {
-                    _endLevel(trait2);
-                    return;
-                }
-                if (--traitRemaining[trait3] == 0) {
-                    _endLevel(trait3);
-                    return;
-                }
-
-                ++i;
-            }
-
-            // Append four tickets (and contributions) for this token’s traits
-            purgeTickets[trait0].push(caller);
-            unchecked {
-                lvlData.traitContributions[trait0][caller] += 1;
-            }
-
-            purgeTickets[trait1].push(caller);
-            unchecked {
-                lvlData.traitContributions[trait1][caller] += 1;
-            }
-
-            purgeTickets[trait2].push(caller);
-            unchecked {
-                lvlData.traitContributions[trait2][caller] += 1;
-            }
-
-            purgeTickets[trait3].push(caller);
-            unchecked {
-                lvlData.traitContributions[trait3][caller] += 1;
-            }
+            ++i;
         }
 
-        // Purge reward: base n + bonus tenths (scaled by PRICE_PURGECOIN/10)
-        if (lvl % 10 == 2) count <<= 1;
-        IPurgeCoinInterface(_coin).mintInGame(caller, (count + bonusTenths) * (PRICE_PURGECOIN / 10));
-
-        emit Purge(msg.sender, tokenIds);
+        traitPurgeTicket[trait0].push(caller);
+        traitPurgeTicket[trait1].push(caller);
+        traitPurgeTicket[trait2].push(caller);
+        traitPurgeTicket[trait3].push(caller);
     }
+
+    if (lvl % 10 == 2) count <<= 1;
+    IPurgeCoinInterface(_coin).mintInGame(caller, (count + bonusTenths) * (PRICE_PURGECOIN / 10));
+    emit Purge(msg.sender, tokenIds);
+}
+
 
 
     // --- Level finalization -------------------------------------------------------------------------
@@ -606,17 +555,14 @@ contract PurgeGame is ERC721A {
         uint256 trophyId = baseTokenId - 1;
 
         uint24 levelSnapshot = level;
-        LevelData storage lvlData = L[levelSnapshot];
 
         if (exterminated < 256) {
-            // Record exterminated trait
-            lvlData.exterminatedTrait = uint8(exterminated);
+            uint8 exTrait = uint8(exterminated);
 
-            // Current pool snapshot
             uint256 pool = prizePool;
 
             // Halving if same trait as prior level
-            uint16 prev = L[levelSnapshot - 1].exterminatedTrait;
+            uint16 prev = lastExterminatedTrait;
             if (exterminated == prev) {
                 uint256 keep = pool >> 1;
                 carryoverForNextLevel += keep;
@@ -627,30 +573,25 @@ contract PurgeGame is ERC721A {
             uint256 ninetyPercent = (pool * 90) / 100;
             uint256 exterminatorShare =
                 (levelSnapshot % 10 == 7 && levelSnapshot >= 25) ? (pool * 40) / 100 : (pool * 20) / 100;
+            uint256 participantShare = ninetyPercent - exterminatorShare;
 
-            uint256 participantShare;
-            unchecked {
-                participantShare = ninetyPercent - exterminatorShare;
-            }
-
-            // Per-ticket endgame payout for the exterminated trait
-            uint8 exTrait = uint8(exterminated);
-            uint256 ticketsLen = L[levelSnapshot].traitPurgeTicket[exTrait].length;
-            lvlData.endgamePayoutAmount = (ticketsLen == 0) ? 0 : (participantShare / ticketsLen);
-
+            // Cache per-ticket payout into prizePool (payEach). Payout happens in state 1.
+            uint256 ticketsLen = traitPurgeTicket[exTrait].length;
+            prizePool = (ticketsLen == 0) ? 0 : (participantShare / ticketsLen);
+            airdropIndex = 0; // payout cursor
 
             // Award trophy (transfer placeholder owned by contract)
             this.transferFrom(address(this), exterminator, trophyId);
             trophyTokenIds.push(trophyId);
             trophyData[trophyId] = (uint256(exTrait) << 152) | (uint256(levelSnapshot) << 128);
 
-            // Seed the next phase’s pool
+            // Seed finalize() pool snapshot and book last trait
             levelPrizePool = pool;
+            lastExterminatedTrait = exTrait;
             _clearDailyPurgeCount();
 
         } else {
             // Non-trait end (e.g., daily jackpot progression end)
-            lvlData.exterminatedTrait = 420;
             trophyData[trophyId] = 0;
 
             if (levelSnapshot % 100 == 0) {
@@ -659,54 +600,41 @@ contract PurgeGame is ERC721A {
             }
 
             carryoverForNextLevel += prizePool;
+            lastExterminatedTrait = 420;
             IPurgeCoinInterface(_coin).resetAffiliateLeaderboard();
         }
 
-        // Move to the next level’s storage index
-        unchecked {
-            levelSnapshot++; level++;
-        }
-        // Reset level state
-        prizePool = 0;
-        for (uint16 t; t < 256; ) {
-            traitRemaining[t] = 0;
-            unchecked {
-                ++t;
-            }
-        }
-        
+        // Advance level
+        unchecked { levelSnapshot++; level++; }
 
+        // Reset level state
+        for (uint16 t; t < 256; ) { traitRemaining[t] = 0; unchecked { ++t; } }
         delete pendingNftMints;
         delete pendingMapMints;
-        airdropIndex = 0;
+        airdropIndex = 0; // will be reused for wipe stage in pregame
         airdropMapsProcessedCount = 0;
         jackpotCounter = 0;
         earlyPurgeJackpotPaidMask = 0;
-        
 
         // Mint next level’s trophy placeholder to the contract
         _mint(address(this), 1);
         baseTokenId = uint64(_nextTokenId());
         trophyData[baseTokenId - 1] = (0xFFFF << 152);
 
-        // Initialize next level’s exterminated sentinel
-        L[levelSnapshot].exterminatedTrait = 420;
-
+        // Price schedule
         uint256 mod100 = levelSnapshot % 100;
-
         if (mod100 == 10 || mod100 == 0) {
             price <<= 1;
         } else if (levelSnapshot % 20 == 0) {
             price += (levelSnapshot < 100) ? 0.05 ether : 0.1 ether;
         }
-    
 
         purchaseCount = 0;
         gameState = 1;
 
-        // Request fresh randomness for the new level
         _requestVrf(uint48(block.timestamp), false);
     }
+
     // --- Endgame finalization (post-trait extermination resolution) ---------------------------------
 
     /// @notice Resolve previous level’s endgame payouts and transition toward the next session.
@@ -715,128 +643,76 @@ contract PurgeGame is ERC721A {
     /// - Distributes affiliate rewards, historical trophy bonuses, and the exterminator’s share.
     /// - Seeds/clears state for the next cycle; may end the 100‑level epoch (`gameState = 0`).
     function _finalizeEndgame(uint24 lvl) internal {
-        // Work on the *previous* level; current `level` has already advanced in `_endLevel`.
-        uint24 prevLevel;
-        unchecked { prevLevel = lvl - 1; }
+        uint24 prevLevel; unchecked { prevLevel = lvl - 1; }
         phase = 0;
-        
 
-        // Only finalize if the prior level ended by trait extermination.
-        if (L[prevLevel].exterminatedTrait == 420) { _clearDailyPurgeCount(); return ;}
+        // Only finalize if prior level ended by trait extermination
+        if (lastExterminatedTrait == 420) { _clearDailyPurgeCount(); return; }
 
-        // Snapshot of the level’s endgame pool (fixed at `_endLevel` time).
         uint256 poolTotal = levelPrizePool;
         if (poolTotal == 0) return;
 
-        // --- Affiliate reward (10% for L1, 5% otherwise) -------------------------------------------
+        // Affiliate reward (10% for L1, 5% otherwise)
         uint256 affPool = (prevLevel == 1) ? (poolTotal * 10) / 100 : (poolTotal * 5) / 100;
         address[] memory affLeaders = IPurgeCoinInterface(_coin).getLeaderboardAddresses(1);
         if (affLeaders.length > 0) _addClaimableEth(affLeaders[0], (affPool * 50) / 100);
         if (affLeaders.length > 1) _addClaimableEth(affLeaders[1], (affPool * 25) / 100);
         if (affLeaders.length > 2) _addClaimableEth(affLeaders[2], (affPool * 15) / 100);
         if (affLeaders.length > 3) {
-            // Randomize among positions [3..end)
             address rndAddr = affLeaders[3 + (rngWord % (affLeaders.length - 3))];
             _addClaimableEth(rndAddr, (affPool * 10) / 100);
         }
 
-        // --- Historical trophy bonus (5% spread across two past trophies) ---------------------------
+        // Historical trophy bonus (5% across two past trophies)
         if (prevLevel > 1) {
             uint256 trophyPool = poolTotal / 20; // 5%
             uint256 trophiesLen = trophyTokenIds.length;
 
             if (trophiesLen > 1) {
-                // Pick two indices from [0..trophiesLen-2]
                 uint256 idA = trophyTokenIds[rngWord % (trophiesLen - 1)];
                 uint256 idB = trophyTokenIds[(rngWord >> 128) % (trophiesLen - 1)];
 
                 uint256 halfA = trophyPool >> 1;
                 uint256 halfB = trophyPool - halfA;
 
-                if (_exists(idA)) {
-                    _addClaimableEth(ownerOf(idA), halfA);
-                    trophyPool -= halfA;
-                }
-                if (_exists(idB)) {
-                    _addClaimableEth(ownerOf(idB), halfB);
-                    trophyPool -= halfB;
-                }
+                if (_exists(idA)) { _addClaimableEth(ownerOf(idA), halfA); trophyPool -= halfA; }
+                if (_exists(idB)) { _addClaimableEth(ownerOf(idB), halfB); trophyPool -= halfB; }
             }
-
-            // Any undistributed dust rolls forward.
             if (trophyPool != 0) carryoverForNextLevel += trophyPool;
         }
 
-        // --- Exterminator’s share (20% or 40%), plus epoch carry if prevLevel%100==0 ----------------
+        // Exterminator’s share (20% or 40%), plus epoch carry if prevLevel%100==0
         uint256 exterminatorShare = (prevLevel % 10 == 7 && prevLevel >= 25)
-            ? (poolTotal * 40) / 100
-            : (poolTotal * 20) / 100;
-
-        if ((prevLevel % 100) == 0) {
-            // End of 100‑level epoch: fold accumulated carry into the exterminator’s credit.
-            exterminatorShare += carryoverForNextLevel;
-        }
+            ? (poolTotal * 40) / 100 : (poolTotal * 20) / 100;
+        if ((prevLevel % 100) == 0) { exterminatorShare += carryoverForNextLevel; }
 
         address exterminatorOwner = ownerOf(trophyTokenIds[trophyTokenIds.length - 1]);
         _addClaimableEth(exterminatorOwner, exterminatorShare);
 
-        // Clear the starting pool marker (consumed by this finalize stage).
         levelPrizePool = 0;
-
-        // Reset affiliate board for the new cycle.
         IPurgeCoinInterface(_coin).resetAffiliateLeaderboard();
 
-        // Epoch conclusion (L%100==0) halts the game; otherwise proceed into main session.
-        if ((prevLevel % 100) == 0) {
-            gameState = 0;
-            phase = 6;
-            return;
-        }
+        if ((prevLevel % 100) == 0) { gameState = 0; phase = 6; return; }
     }
+
 
 
     // --- Claiming winnings (ETH) --------------------------------------------------------------------
 
-    /// @notice Claim or quote the caller’s accrued ETH winnings (affiliates, jackpots, endgame payouts).
-    /// @param player The account whose winnings to aggregate.
-    /// @param pay    If true, transfers ETH; if false, returns the computed amount only.
-    /// @return amount Total amount in wei attributed to `player`.
-    function claimWinnings(address player, bool pay) public returns (uint256 amount) {
-        if (pay && player != msg.sender) revert E();
+    /// @notice Claim the caller’s accrued ETH winnings (affiliates, jackpots, endgame payouts).
 
-        uint24 lvl = level;
-        uint24 scanFrom = lvl > 100 ? lvl - 100 : 1;
-
-        // Start with explicit credit bucket (affiliates / jackpots / misc).
-        amount = claimableWinnings[player];
-
-        // Add per-level endgame payouts (only for levels with a real exterminated trait).
-        for (uint24 i = scanFrom; i < lvl; ) {
-            LevelData storage lvlData = L[i];
-            uint16 ex = lvlData.exterminatedTrait;
-            if (ex < 256) {
-                uint256 payoutPerTicket = lvlData.endgamePayoutAmount;
-                if (payoutPerTicket != 0) {
-                    uint8 exTrait = uint8(ex);
-                    uint256 tickets = lvlData.traitContributions[exTrait][player];
-                    if (tickets != 0) {
-                        unchecked { amount += tickets * payoutPerTicket; }
-                        if (pay) lvlData.traitContributions[exTrait][player] = 0; // consume tickets
-                    }
-                }
-            }
-            unchecked { ++i; }
-        }
-
-        if (!pay) return amount;
-
-        // Zero explicit credit *before* external call.
+    function claimWinnings() external {
+        address player = msg.sender;
+        uint256 amount = claimableWinnings[player];
         claimableWinnings[player] = 0;
-
-        // Payout
         (bool ok, ) = payable(player).call{value: amount}("");
         if (!ok) revert E();
     }
+
+    function getWinnings() external view returns (uint256){
+        return claimableWinnings[msg.sender];
+    }
+
     // --- Credits & jackpot helpers ------------------------------------------------------------------
 
     /// @notice Credit ETH winnings to a player’s claimable balance and emit an accounting event.
@@ -860,17 +736,15 @@ contract PurgeGame is ERC721A {
         permille = uint8(MAP_PERMILLE >> (uint256(index) * 8));
     }
 
-    /// @notice Expose trait-ticket sampling (view helper for off-chain verification / UI).
+    /// @notice Expose trait-ticket sampling (view helper for coinJackpot).
     function getJackpotWinners(
         uint256 randomWord,
         uint8 trait,
         uint8 numWinners,
         uint8 salt
     ) external view returns (address[] memory) {
-        uint24 lvl = level;
-        if (gameState == 1) lvl -=1;
         return JackpotUtils._randTraitTicket(
-            L[lvl].traitPurgeTicket,
+            traitPurgeTicket,
             randomWord,
             trait,
             numWinners,
@@ -890,23 +764,19 @@ contract PurgeGame is ERC721A {
     /// @return finished True when complete; false if an external phase needs more calls.
     function payMapJackpot(uint32 cap, uint24 lvl) internal returns (bool finished) {
         uint256 carryWei = carryoverForNextLevel;
-        
 
-        // Optional external jackpots (return early until each phase reports finished).
         if (lvl % 20 == 0) {
-            uint256 bafPoolWei = (carryWei * 24) / 100; // 24% to BAF
+            uint256 bafPoolWei = (carryWei * 24) / 100;
             if (!_progressExternal(0, bafPoolWei, cap, lvl)) return false;
         } else if (lvl >= 25 && (lvl % 10) == 5)  {
-            uint256 decPoolWei = (carryWei * 15) / 100; // 15% to Decimator
+            uint256 decPoolWei = (carryWei * 15) / 100;
             if (!_progressExternal(1, decPoolWei, cap, lvl)) return false;
         }
-        // Mint a small Purgecoin bonus to creator based on total ETH in the prize pool.
 
-        // Re-read carry after any external phase may have returned funds.
         carryWei = carryoverForNextLevel;
         uint256 totalWei = carryWei + prizePool;
         IPurgeCoinInterface(_coin).mintInGame(creator, (totalWei * 10 * PRICE_PURGECOIN) / 1 ether);
-        // Derive level-dependent saving percentage into next level.
+
         uint256 rndWord = uint256(keccak256(abi.encode(rngWord, uint8(3))));
         uint256 savePct;
         if (lvl < 10) {
@@ -917,11 +787,10 @@ contract PurgeGame is ERC721A {
             else if (lvl < 60) savePct = 60 + (rndWord % 21);
             else if (lvl < 80) savePct = 60 + (rndWord % 26);
             else if (lvl == 99) savePct = 93;
-            else                      savePct = 65 + (rndWord % 26);
+            else                savePct = 65 + (rndWord % 26);
             if (lvl % 10 == 9) savePct += 5;
         }
 
-        // Compute effective pool for this map (and rollover savings).
         uint256 effectiveWei;
         if (lvl % 100 == 0) {
             effectiveWei = totalWei;
@@ -932,11 +801,9 @@ contract PurgeGame is ERC721A {
             effectiveWei = totalWei - saveNextWei;
         }
 
-        // Rotate pools: remember last prize pool baseline and set current effective pool.
         lastPrizePool = prizePool;
         prizePool = effectiveWei;
 
-        // Trait selection & payouts (9 buckets).
         bool doubleMap = ((lvl % 100) == 30) || ((lvl % 100) == 50) || ((lvl % 100) == 70);
         uint256 packedTraits;
         uint256 totalPaidWei;
@@ -944,55 +811,42 @@ contract PurgeGame is ERC721A {
         for (uint8 idx; idx < 9; ) {
             (uint8 winnersN, uint8 permille) = _mapSpec(idx);
 
-            // First bucket: use full 8 random bits; subsequent buckets: 6 bits + quadrant offset.
             uint8 traitId = (idx == 0)
                 ? uint8(rndWord & 0xFF)
                 : uint8((rndWord >> (8+((idx-1) * 6)) & 0x3F) + ((idx - 1) << 6));
 
-            // Pack the chosen trait (8 bits per slot).
             packedTraits |= uint256(traitId) << (idx * 8);
 
-            // Draw winners from the per‑trait ticket pool (at most `winnersN`).
             address[] memory winners = JackpotUtils._randTraitTicket(
-                L[lvl].traitPurgeTicket,
+                traitPurgeTicket,
                 rndWord,
                 traitId,
                 winnersN,
                 uint8(42 + idx)
             );
 
-            // Bucket value: permille slice of effective pool; doubled at steps 30/50/70.
             uint256 bucketWei = (effectiveWei * permille) / 1000;
             if (doubleMap) bucketWei <<= 1;
 
-            // Split equally among actual winners.
             uint256 winnersLen = winners.length;
             if (winnersLen != 0) {
                 uint256 prizeEachWei = bucketWei / winnersLen;
                 uint256 paidWei = prizeEachWei * winnersLen;
                 unchecked { totalPaidWei += paidWei; }
-
                 for (uint256 k; k < winnersLen; ) {
                     _addClaimableEth(winners[k], prizeEachWei);
                     unchecked { ++k; }
                 }
             }
-
             unchecked { ++idx; }
         }
 
-        // Reduce prize pool by distributions; seed next stage’s starting pool.
-        unchecked {
-            prizePool -= totalPaidWei;
-            levelPrizePool = prizePool;
-        }
+        unchecked { prizePool -= totalPaidWei; levelPrizePool = prizePool; }
 
-
-
-        // Emit packed traits (header=9 indicates map jackpot event).
         emit Jackpot((uint256(9) << 248) | packedTraits);
         return true;
     }
+
     // --- Daily & early‑purge jackpots ---------------------------------------------------------------
 
     /// @notice Pay four jackpot groups either during daily payouts or early‑purge sessions.
@@ -1004,55 +858,38 @@ contract PurgeGame is ERC721A {
     /// - Per‑group allocation is an equal split of `dailyTotal / 4` across sampled winners (integer division).
     /// - Updates `jackpotCounter` up/down depending on the mode and emits a `Jackpot(kind=4, traits...)` event.
     function payDailyJackpot(bool isDaily, uint24 lvl) internal {
-        // RNG source for this run.
         uint256 randWord = isDaily
             ? rngWord
             : uint256(keccak256(abi.encode(rngWord, uint8(5), jackpotCounter)));
 
-        // Resolve current level & ticket storage.
+        mapping(uint8 => address[]) storage ticketsByTrait = traitPurgeTicket;
 
-        LevelData storage lvlData = L[lvl];
-        mapping(uint8 => address[]) storage ticketsByTrait = lvlData.traitPurgeTicket;
-
-        // Pick the four winning traits.
         uint8[4] memory winningTraits = isDaily
             ? JackpotUtils._getWinningTraits(randWord, dailyPurgeCount)
             : JackpotUtils._getRandomTraits(randWord);
 
-        // Scale number of winners per group by position within the 100‑level epoch.
         uint8 stepWithinCentury = uint8(lvl % 100);
         uint256 multiplier = 1 + (stepWithinCentury / 20); // 1..5
 
-        // Determine total pot for this run.
         uint256 dailyTotalWei;
         if (isDaily) {
-            // 2.5%, 3.0%, …, 9.5% of levelPrizePool as jackpotCounter grows (sum≈90% over 15 days).
             dailyTotalWei = (levelPrizePool * (250 + uint256(jackpotCounter) * 50)) / 10_000;
         } else {
-            // Early‑purge session takes a slice from carryover.
             uint256 baseWei = carryoverForNextLevel;
-            if ((lvl % 20) == 0) {
-                dailyTotalWei = baseWei / 100;           // 1.0%
-            } else if (lvl >= 21 && (lvl % 10) == 1) {
-                dailyTotalWei = (baseWei * 6) / 100;     // 6.0%
-            } else {
-                dailyTotalWei = baseWei / 40;            // 2.5%
-            }
+            if ((lvl % 20) == 0)      dailyTotalWei = baseWei / 100;
+            else if (lvl >= 21 && (lvl % 10) == 1) dailyTotalWei = (baseWei * 6) / 100;
+            else                      dailyTotalWei = baseWei / 40;
         }
 
-        // Split pot equally across the four groups.
         uint256 perGroupWei = dailyTotalWei / 4;
         uint256 totalPaidWei;
 
-        // Pay each group.
         for (uint8 groupIdx; groupIdx < 4; ) {
-            // Winner targets per group (scaled by epoch step).
             uint256 wantWinners =
                 groupIdx == 0 ? 30 * multiplier :
                 groupIdx == 1 ? 20 * multiplier :
                 groupIdx == 2 ? 10 * multiplier : 1;
 
-            // Sample winners from the trait’s ticket pool.
             address[] memory winners = JackpotUtils._randTraitTicket(
                 ticketsByTrait,
                 randWord,
@@ -1061,7 +898,6 @@ contract PurgeGame is ERC721A {
                 uint8(69 + groupIdx)
             );
 
-            // Equal split for this group.
             uint256 winnersLen = winners.length;
             if (winnersLen != 0) {
                 uint256 prizeEachWei = perGroupWei / winnersLen;
@@ -1073,11 +909,9 @@ contract PurgeGame is ERC721A {
                     }
                 }
             }
-
             unchecked { ++groupIdx; }
         }
 
-        // Emit packed winning traits (kind=4).
         emit Jackpot(
             (uint256(4) << 248)
             | uint256(winningTraits[0])
@@ -1086,11 +920,10 @@ contract PurgeGame is ERC721A {
             | (uint256(winningTraits[3]) << 24)
         );
 
-        // Bookkeeping by mode.
         if (isDaily) {
             unchecked { ++jackpotCounter; }
             prizePool -= totalPaidWei;
-            if (jackpotCounter >= 15 || (lvl % 100 == 0 && jackpotCounter == 14)) { _endLevel(420); return; } // End-of-cycle sweep
+            if (jackpotCounter >= 15 || (lvl % 100 == 0 && jackpotCounter == 14)) { _endLevel(420); return; }
             _clearDailyPurgeCount();
         } else {
             unchecked { carryoverForNextLevel -= totalPaidWei; --jackpotCounter; }
@@ -1287,20 +1120,18 @@ contract PurgeGame is ERC721A {
         uint32  count,
         uint256 entropyWord
     ) private {
-        uint32[256] memory counts;           // per-trait symbol counts in this batch
-        uint8[256]  memory touchedTraits;    // compact list of traits touched
+        uint32[256] memory counts;
+        uint8[256]  memory touchedTraits;
         uint16      touchedLen;
 
         uint32 endIndex = startIndex + count;
         uint32 i = startIndex;
 
-        // Generate symbols in groups of 16 using a per-group seed; xorshift* inside the group.
         while (i < endIndex) {
             uint32 groupIdx = i >> 4; // i / 16
             uint256 seed = uint256(keccak256(abi.encodePacked(baseKey + groupIdx, entropyWord)));
             uint64 s = uint64(seed) | 1;
 
-            // align to the correct intra-group position
             uint8 offset = uint8(i & 15);
             for (uint8 skip; skip < offset; ) {
                 s ^= (s >> 12); s ^= (s << 25); s ^= (s >> 27);
@@ -1308,7 +1139,6 @@ contract PurgeGame is ERC721A {
                 unchecked { ++skip; }
             }
 
-            // now produce symbols from the aligned position
             for (uint8 j = offset; j < 16 && i < endIndex; ) {
                 s ^= (s >> 12); s ^= (s << 25); s ^= (s >> 27);
                 uint64 rnd64 = s * 2685821657736338717;
@@ -1321,28 +1151,19 @@ contract PurgeGame is ERC721A {
             }
         }
 
-
-        // Persist results: update contributions and append tickets.
-        LevelData storage curr = L[level];
-        mapping(uint8 => address[]) storage tickets = curr.traitPurgeTicket;
-
         for (uint16 u; u < touchedLen; ) {
             uint8  traitId      = touchedTraits[u];
             uint32 occurrences  = counts[traitId];
 
-            unchecked { curr.traitContributions[traitId][player] += occurrences; }
-
-            // Append `player` `occurrences` times to the dynamic array tickets[traitId].
             assembly {
                 mstore(0x00, traitId)
-                mstore(0x20, tickets.slot)
-                let arr := keccak256(0x00, 0x40)     // storage slot of tickets[traitId]
-                let len := sload(arr)                // current array length
-                sstore(arr, add(len, occurrences))   // increase length by `occurrences`
+                mstore(0x20, traitPurgeTicket.slot)
+                let arr := keccak256(0x00, 0x40)
+                let len := sload(arr)
+                sstore(arr, add(len, occurrences))
                 mstore(0x00, arr)
-                let data := keccak256(0x00, 0x20)    // base slot for array elements
+                let data := keccak256(0x00, 0x20)
                 let addr := player
-                // Write `player` sequentially `occurrences` times
                 for { let k := 0 } lt(k, occurrences) { k := add(k, 1) } {
                     sstore(add(data, add(len, k)), addr)
                 }
@@ -1351,6 +1172,7 @@ contract PurgeGame is ERC721A {
             unchecked { ++u; }
         }
     }
+
     // --- Trait weighting / helpers -------------------------------------------------------------------
 
     /// @notice Map a 32-bit random input to an 0..7 bucket with a fixed piecewise distribution.
@@ -1414,16 +1236,6 @@ contract PurgeGame is ERC721A {
 
     // --- Views / overrides ---------------------------------------------------------------------------
 
-    /// @notice Read‑only quote of pending winnings for `msg.sender` without modifying state.
-    /// @dev Uses a staticcall to reuse the accounting in `claimWinnings(p,false)`.
-    function quoteWinnings() external view returns (uint256 amt) {
-        address player = msg.sender;
-        (bool ok, bytes memory out) =
-            address(this).staticcall(abi.encodeWithSelector(this.claimWinnings.selector, player, false));
-        if (!ok || out.length < 32) revert E();
-        amt = abi.decode(out, (uint256));
-    }
-
     /// @inheritdoc ERC721A
     /// @dev Disallows reading ownership for pre‑trophy era tokens unless they are trophies.
     function ownerOf(uint256 tokenId) public view override returns (address) {
@@ -1442,31 +1254,23 @@ contract PurgeGame is ERC721A {
     ///     bits [23:00] : packed 4×6‑bit traits (uint24)
     function tokenURI(uint256 tokenId) public view override returns (string memory) {
         uint256 trophyInfo = trophyData[tokenId];
-
-        // Disallow old non‑trophies from previous eras.
         if (tokenId < baseTokenId - 1 && trophyInfo == 0) revert E();
 
-        // Trophy: delegate to renderer with the packed trophy info; remaining array is zeroed.
         uint32[4] memory remaining;
         if (trophyInfo != 0) {
             return IPurgeRenderer(_renderer).tokenURI(tokenId, trophyInfo, remaining);
         }
 
-
-
-        // Load packed traits and compute the four trait IDs in their 0..255 namespaces.
         uint24 traitsPacked = tokenTraits[tokenId];
-        uint256 lastExterminated = L[level - 1].exterminatedTrait;
+        uint256 lastExterminated = lastExterminatedTrait;
 
         uint8 t0 = uint8(traitsPacked);                 // 0..63
         uint8 t1 = uint8(traitsPacked >>  6) |  64;     // 64..127
         uint8 t2 = uint8(traitsPacked >> 12) | 128;     // 128..191
         uint8 t3 = uint8(traitsPacked >> 18) | 192;     // 192..255
 
-        // Pack high‑level game info + traits for the renderer.
         uint256 metaPacked = (lastExterminated << 48) | (uint256(level) << 24) | uint256(traitsPacked);
 
-        // Provide remaining counts per trait namespace (live view of current level state).
         remaining[0] = traitRemaining[t0];
         remaining[1] = traitRemaining[t1];
         remaining[2] = traitRemaining[t2];
@@ -1474,6 +1278,7 @@ contract PurgeGame is ERC721A {
 
         return IPurgeRenderer(_renderer).tokenURI(tokenId, metaPacked, remaining);
     }
+
 
     /// @notice Return pending mints/maps owed to a player (airdrop queues).
     function getPlayerPurchases(address player)
@@ -1485,13 +1290,25 @@ contract PurgeGame is ERC721A {
         maps  = playerMapMintsOwed[player];
     }
 
-    /// @notice Return the caller’s ticket counts per trait for the *current* level.
-    /// @dev tickets[i] is the number of contributions for trait `i` (0..255).
-    function getTickets(address player) external view returns (uint32[256] memory tickets) {
-        LevelData storage curr = L[level];
-        for (uint256 i; i < 256; ) {
-            tickets[i] = curr.traitContributions[uint8(i)][player];
-            unchecked { ++i; }
-        }
+    function _payoutParticipants(uint32 capHint) internal {
+        address[] storage arr = traitPurgeTicket[uint8(lastExterminatedTrait)];
+        uint32 len = uint32(arr.length);
+        if (len == 0) { prizePool = 0; airdropIndex = 0; return; }
+
+        uint32 cap = capHint == 0 ? DEFAULT_PAYOUTS_PER_TX : capHint;
+        uint32 end = airdropIndex + cap; if (end > len) end = len;
+
+        uint256 payEach = prizePool; // cached here during pregame
+        for (uint32 i = airdropIndex; i < end; ++i) { _addClaimableEth(arr[i], payEach); }
+
+        airdropIndex = end;
+        if (end == len) { prizePool = 0; airdropIndex = 0; }
+    }
+
+    function _wipeTickets(uint32 capHint) internal {
+        uint32 step = capHint == 0 ? 256 : capHint;
+        uint32 lim = airdropIndex + step; if (lim > 256) lim = 256;
+        for (uint32 i = airdropIndex; i < lim; ++i) { delete traitPurgeTicket[uint8(i)]; }
+        airdropIndex = lim;
     }
 }

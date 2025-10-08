@@ -660,7 +660,7 @@ contract Purgecoin is ERC20, VRFConsumerBaseV2Plus {
     ///      (4) Cleanup in batches; on completion, reset per‑round state and unpause betting.
     /// @param level Current PurgeGame level (used to gate 1/run and propagate stakes).
     /// @param cap   Work cap hint. cap==0 uses defaults; otherwise applies directly.
-    /// @param bonusFlip Applies 20% bonus to 2nd flip of the level
+    /// @param bonusFlip Applies 10% bonus to last flip of purchase phase
     /// @return finished True once the entire cycle—including cleanup—has completed.
     function processCoinflipPayouts(uint24 level, uint32 cap, bool bonusFlip)
         external
