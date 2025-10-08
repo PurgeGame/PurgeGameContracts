@@ -101,9 +101,6 @@ contract Purgecoin is ERC20, VRFConsumerBaseV2Plus {
     uint256 private constant ONEK              = 1_000 * MILLION; // 1,000 PURGED (6d)
     uint32  private constant BAF_BATCH         = 5000;
     uint256 private constant BUCKET_SIZE       = 750;
-    uint256 private constant TOKEN_PRICE_WEI   = 25_000_000_000_000; // 0.000025 ETH per PURGED (info)
-    uint256 private constant UNITS_PER_ETH     = 40_000 * 1_000_000; // 40k PURGED (6d) per 1 ETH (info)
-    uint32  private constant CLEANUP_BATCH     = 100;       // buckets per cleanup call
     uint256 private constant LUCK_PER_LINK     = 220 * MILLION; // 220 PURGE per 1 LINK
 
 
@@ -673,11 +670,8 @@ contract Purgecoin is ERC20, VRFConsumerBaseV2Plus {
     {
         if (!isBettingPaused) return true;
         // --- Step sizing (bounded work) ----------------------------------------------------
-        uint32 stepStake   = (cap == 0) ? 200 : cap;      // # stakers to process this call
-        uint32 stepPayout  = (cap == 0) ? 200 : cap;      // # players to pay this call
-        uint32 cleanupStep = (cap == 0)
-            ? CLEANUP_BATCH
-            : uint32((uint256(cap) + BUCKET_SIZE - 1) / BUCKET_SIZE + 2); // ~cap/BUCKET_SIZE + slack
+        uint32 stepStake  = (cap == 0) ? 200 : cap;
+        uint32 stepPayout = (cap == 0) ? 200 : cap;
 
         uint256 word = rng.word;
         bool  win = (word & 1) == 1;
@@ -805,24 +799,13 @@ contract Purgecoin is ERC20, VRFConsumerBaseV2Plus {
             unchecked { ++i; wheel = (wheel == 9) ? 0 : (wheel + 1); }
         }
         payoutIndex = uint32(end);
-
-        // --- (4) Cleanup (windowed by cleanupStep); reset state when fully complete ----------
+        // --- (4) Cleanup (single-shot) -------------------------------------------
         if (end >= totalPlayers) {
-            uint256 len = coinflipBuckets.length;
-            uint32 cur  = (cleanupCursor == SS_IDLE) ? 0 : cleanupCursor;
-            uint256 cend = uint256(cur) + cleanupStep; if (cend > len) cend = len;
-
-            for (uint256 b = cur; b < cend; ) { delete coinflipBuckets[b]; unchecked { ++b; } }
-            cleanupCursor = uint32(cend);
-
-            if (cend != len) return false; // continue cleanup next call
-
-            // Hard reset for next round
+            // O(1) clear; inner arrays become unreachable and are overwritten on reuse
             delete coinflipBuckets;
             coinflipPlayersCount = 0;
 
-            scanCursor    = SS_IDLE;
-            cleanupCursor = SS_IDLE;
+            scanCursor = SS_IDLE;
 
             for (uint8 k; k < topLen; ) {
                 address q = topBettors[k].player;
@@ -842,6 +825,7 @@ contract Purgecoin is ERC20, VRFConsumerBaseV2Plus {
             rngRequestId = 0;
             return true;
         }
+
 
         return false;
     }
@@ -1381,11 +1365,7 @@ contract Purgecoin is ERC20, VRFConsumerBaseV2Plus {
     /// @param p   Player address.
     function _decPush(uint24 lvl, address p) internal {
         uint256 idx = decPlayersCount[lvl];
-        uint256 bucketIdx = idx / BUCKET_SIZE;
-        if (bucketIdx == decBuckets[lvl].length) {
-            decBuckets[lvl].push();
-        }
-        decBuckets[lvl][bucketIdx].push(p);
+        decBuckets[lvl][idx / BUCKET_SIZE].push(p);
         unchecked { decPlayersCount[lvl] = idx + 1; }
     }
 

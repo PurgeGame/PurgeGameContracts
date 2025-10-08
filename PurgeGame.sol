@@ -201,8 +201,6 @@ contract PurgeGame is ERC721A {
     /// @return price_                   Current mint price (wei)
     /// @return lastPrizePool_           Previous level's effective prize pool snapshot (wei)
     /// @return prizePool_               Current level’s live prize pool (wei)
-    /// @return levelPrizePool_          Actual prize pool to be paid (wei)
-    /// @return carryoverForNextLevel_   Amount reserved for next level (wei)
     /// @return enoughPurchases          True if purchaseCount >= 1500
     /// @return rngFulfilled_            Last VRF request fulfilled
     /// @return rngConsumed_             Last VRF word consumed by game logic
@@ -215,8 +213,6 @@ contract PurgeGame is ERC721A {
             uint256 price_,
             uint256 lastPrizePool_,
             uint256 prizePool_,
-            uint256 levelPrizePool_,
-            uint256 carryoverForNextLevel_,
             bool enoughPurchases,
             bool rngFulfilled_,
             bool rngConsumed_
@@ -227,8 +223,6 @@ contract PurgeGame is ERC721A {
         price_                   = price;
         lastPrizePool_           = lastPrizePool;
         prizePool_               = prizePool;
-        levelPrizePool_          = levelPrizePool;
-        carryoverForNextLevel_   = carryoverForNextLevel;
         enoughPurchases          = (purchaseCount >= 1500);
         rngFulfilled_            = rngFulfilled;
         rngConsumed_             = rngConsumed;
@@ -390,7 +384,26 @@ contract PurgeGame is ERC721A {
         uint256 randomWord   = rngWord;
         uint256 tokenIdStart = uint256(baseTokenId) + uint256(purchaseCount);
         for (uint32 i; i < totalScheduled; ) {
-            _rarity(tokenIdStart + i, randomWord);
+            uint256 _tokenId = tokenIdStart + i;
+            uint256 rand = uint256(keccak256(abi.encodePacked(_tokenId, randomWord)));
+            uint8 tA = _getTrait(uint64(rand));
+            uint8 tB = _getTrait(uint64(rand >>  64));
+            uint8 tC = _getTrait(uint64(rand >> 128));
+            uint8 tD = _getTrait(uint64(rand >> 192));
+
+            // Pack 4x6-bit traits (A,B,C,D) into 24 bits.
+            tokenTraits[_tokenId] = uint24(tA)
+                | (uint24(tB) << 6)
+                | (uint24(tC) << 12)
+                | (uint24(tD) << 18);
+
+            // Increment remaining counts for each tier-mapped trait bucket.
+            unchecked {
+                traitRemaining[tA]          += 1;       // base 0..63
+                traitRemaining[tB |  64]    += 1;       // 64..127
+                traitRemaining[tC | 128]    += 1;       // 128..191
+                traitRemaining[tD | 192]    += 1;       // 192..255
+            }
             unchecked { ++i; }
         }
 
@@ -816,7 +829,6 @@ contract PurgeGame is ERC721A {
         }
 
         if (!pay) return amount;
-        if (amount == 0) revert E();
 
         // Zero explicit credit *before* external call.
         claimableWinnings[player] = 0;
@@ -1164,31 +1176,6 @@ contract PurgeGame is ERC721A {
         IPurgeCoinInterface(_coin).burnInGame(msg.sender, amount);
     }
 
-    /// @notice Assign four traits to a token using a per-token entropy and update live supply counters.
-    /// @param tokenId The NFT id being generated.
-    /// @param entropy The RNG word used to derive rarity (can be zero; tokenId still diversifies).
-    function _rarity(uint256 tokenId, uint256 entropy) private {
-        uint256 rand = uint256(keccak256(abi.encodePacked(tokenId, entropy)));
-
-        uint8 tA = _getTrait(uint64(rand));
-        uint8 tB = _getTrait(uint64(rand >>  64));
-        uint8 tC = _getTrait(uint64(rand >> 128));
-        uint8 tD = _getTrait(uint64(rand >> 192));
-
-        // Pack 4x6-bit traits (A,B,C,D) into 24 bits.
-        tokenTraits[tokenId] = uint24(tA)
-            | (uint24(tB) << 6)
-            | (uint24(tC) << 12)
-            | (uint24(tD) << 18);
-
-        // Increment remaining counts for each tier-mapped trait bucket.
-        unchecked {
-            traitRemaining[tA]          += 1;       // base 0..63
-            traitRemaining[tB |  64]    += 1;       // 64..127
-            traitRemaining[tC | 128]    += 1;       // 128..191
-            traitRemaining[tD | 192]    += 1;       // 192..255
-        }
-    }
     // --- Map / NFT airdrop batching ------------------------------------------------------------------
 
     /// @notice Process a batch of “map” mints for players awaiting symbol credits.
@@ -1465,8 +1452,7 @@ contract PurgeGame is ERC721A {
             return IPurgeRenderer(_renderer).tokenURI(tokenId, trophyInfo, remaining);
         }
 
-        // Regular token: must exist in the current era.
-        if (!_exists(tokenId)) revert E();
+
 
         // Load packed traits and compute the four trait IDs in their 0..255 namespaces.
         uint24 traitsPacked = tokenTraits[tokenId];
