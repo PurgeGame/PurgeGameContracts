@@ -264,7 +264,7 @@ contract PurgeGame is ERC721A {
             }
 
             // luckbox rewards
-            if (coin.playerLuckbox(msg.sender) < PRICE_PURGECOIN * lvl) revert LuckboxTooSmall();
+            if (cap == 0 && coin.playerLuckbox(msg.sender) < PRICE_PURGECOIN * lvl) revert LuckboxTooSmall();
 
             // Arm VRF when due/new (reward allowed)
             if ((rngConsumed && day != dayIdx) || rngTs == 0) { _requestVrf(ts, dontStopFlips); break; }
